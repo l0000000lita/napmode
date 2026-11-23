@@ -1,0 +1,5 @@
+.build/
+NapMode.app/
+dist/
+*.dmg
+.DS_Store
