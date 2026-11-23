@@ -35,3 +35,7 @@ open NapMode.app
 ```
 
 `swift run NapCoreTests -- --live` 会短暂压低当前外接屏的白点，然后恢复。
+
+## 许可
+
+[MIT](LICENSE)
