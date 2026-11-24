@@ -112,7 +112,15 @@ private final class FileNapStore: NapStateStoring {
 
     func load() -> SavedState? {
         loadFailureNotice = nil
-        guard let data = try? Data(contentsOf: url) else { return nil }
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return nil
+        } catch {
+            loadFailureNotice = "恢复记录无法读取，已忽略。"
+            return nil
+        }
         if let state = try? JSONDecoder().decode(SavedState.self, from: data) {
             return state
         }
@@ -162,7 +170,9 @@ public struct NapController {
         self.displays = displays
         self.store = store
         let loaded = store.load()
-        if let loaded, !loaded.displays.isEmpty {
+        if let loaded,
+           !loaded.displays.isEmpty,
+           loaded.displays.allSatisfy(gammaChannelsAreInRange) {
             self.saved = loaded
             self.dimming = loaded.phase == .napping
             self.fileCleanupOnly = loaded.phase == .cleanupOnly

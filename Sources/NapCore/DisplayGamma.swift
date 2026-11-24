@@ -61,19 +61,20 @@ public func planDisplayWrites(targets: [DisplayTable], online: [OnlineDisplay]) 
     return plan
 }
 
-public func gammaChannelsAreWritable(_ table: DisplayTable, capacity: Int) -> Bool {
+public func gammaChannelsAreInRange(_ table: DisplayTable) -> Bool {
     let count = table.red.count
-    let limit = capacity > 0 ? capacity : 256
-    guard count > 0,
-          count == table.green.count,
-          count == table.blue.count,
-          count <= limit else {
+    guard count > 0, count == table.green.count, count == table.blue.count else {
         return false
     }
     let valid = { (samples: [Float]) in
         samples.allSatisfy { $0.isFinite && (0...1).contains($0) }
     }
     return valid(table.red) && valid(table.green) && valid(table.blue)
+}
+
+public func gammaChannelsAreWritable(_ table: DisplayTable, capacity: Int) -> Bool {
+    let limit = capacity > 0 ? capacity : 256
+    return gammaChannelsAreInRange(table) && table.red.count <= limit
 }
 
 public final class DisplayGamma: DisplayGammaControlling {

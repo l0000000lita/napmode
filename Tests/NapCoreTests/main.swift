@@ -469,6 +469,42 @@ func testEmptyOrCorruptRecordDoesNotStartNap() throws {
     try check(fake.writes.isEmpty, "corrupt record must not write")
 }
 
+func testUnusableCurveDoesNotStickInRestore() throws {
+    let fake = FakeDisplays(captured: GammaSnapshot(displays: [table(serial: 1, end: 1)]))
+    var broken = table(serial: 1, end: 1)
+    broken.red = []
+    let store = ScriptedStore()
+    store.state = SavedState(phase: .pendingRestore, displays: [broken])
+    let nap = NapController(displays: fake, store: store)
+    try check(nap.phase == .off, "unusable curve is ignored, got \(nap.phase)")
+    try check(!nap.isOn, "unusable curve must not dim")
+    try check(nap.notice?.contains("无效") == true, "notice \(nap.notice ?? "")")
+    nap.reapply()
+    try check(fake.writes.isEmpty, "ignored curve must not write")
+
+    var long = table(serial: 2, end: 0.5)
+    long.red = Array(repeating: Float(0.5), count: 300)
+    long.green = long.red
+    long.blue = long.red
+    let longStore = ScriptedStore()
+    longStore.state = SavedState(phase: .napping, displays: [long])
+    let resumed = NapController(displays: fake, store: longStore)
+    try check(resumed.isOn, "a long but valid curve can still resume")
+}
+
+func testMissingFileIsQuietAndUnreadableFileIsReported() throws {
+    let fake = FakeDisplays(captured: GammaSnapshot(displays: [table(serial: 1, end: 1)]))
+    let missing = NapController(displays: fake, savedURL: temporarySavedURL())
+    try check(missing.phase == .off, "missing file stays off")
+    try check(missing.notice == nil, "missing file has no notice, got \(missing.notice ?? "")")
+
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let unreadable = NapController(displays: fake, savedURL: directory)
+    try check(unreadable.phase == .off, "unreadable record stays off")
+    try check(unreadable.notice?.contains("无法读取") == true, "notice \(unreadable.notice ?? "")")
+}
+
 func testLiveRoundTrip() throws {
     let gamma = DisplayGamma()
     let before = try gamma.capture()
@@ -504,6 +540,8 @@ do {
     try testCleanupOnlyRelaunchDoesNotRewriteGamma()
     try testAmbiguousStartKeepsTheSpecificNotice()
     try testEmptyOrCorruptRecordDoesNotStartNap()
+    try testUnusableCurveDoesNotStickInRestore()
+    try testMissingFileIsQuietAndUnreadableFileIsReported()
     if CommandLine.arguments.contains("--live") {
         try testLiveRoundTrip()
     }
