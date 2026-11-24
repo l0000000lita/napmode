@@ -9,7 +9,7 @@ final class NapModel: ObservableObject {
     @Published var message: String?
     private var nap: NapController?
     private var timer: Timer?
-    private var signalSource: DispatchSourceSignal?
+    private var signalSources: [DispatchSourceSignal] = []
     private var finishing = false
 
     init() {
@@ -22,11 +22,6 @@ final class NapModel: ObservableObject {
         }
         nap = controller
         publish(controller)
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.reapplyIfNapping()
-            }
-        }
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification,
             object: nil,
@@ -36,15 +31,17 @@ final class NapModel: ObservableObject {
                 self?.finish()
             }
         }
-        signal(SIGTERM, SIG_IGN)
-        let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-        source.setEventHandler { [weak self] in
-            MainActor.assumeIsolated {
-                self?.quit()
+        for sig in [SIGTERM, SIGINT] {
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            source.setEventHandler { [weak self] in
+                MainActor.assumeIsolated {
+                    self?.quit()
+                }
             }
+            source.resume()
+            signalSources.append(source)
         }
-        source.resume()
-        signalSource = source
     }
 
     var menuTitle: String {
@@ -90,11 +87,22 @@ final class NapModel: ObservableObject {
     }
 
     func quit() {
-        if !finishing {
-            finishing = true
-            finish()
-        }
+        finish()
         NSApplication.shared.terminate(nil)
+    }
+
+    private func syncTimer() {
+        if phase == .napping {
+            guard timer == nil else { return }
+            timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.reapplyIfNapping()
+                }
+            }
+        } else {
+            timer?.invalidate()
+            timer = nil
+        }
     }
 
     private func reapplyIfNapping() {
@@ -103,6 +111,10 @@ final class NapModel: ObservableObject {
     }
 
     private func finish() {
+        guard !finishing else { return }
+        finishing = true
+        timer?.invalidate()
+        timer = nil
         guard var controller = nap else { return }
         controller.stop()
         nap = controller
@@ -115,6 +127,7 @@ final class NapModel: ObservableObject {
         if message == nil {
             message = controller.notice
         }
+        syncTimer()
     }
 }
 

@@ -68,6 +68,7 @@ public struct SavedState: Codable, Equatable {
     public enum Phase: String, Codable {
         case napping
         case pendingRestore
+        case cleanupOnly
     }
 
     public var phase: Phase
@@ -94,16 +95,23 @@ public protocol NapStateStoring: AnyObject {
     func load() -> SavedState?
     func replace(_ state: SavedState) throws
     func remove() throws
+    var loadFailureNotice: String? { get }
+}
+
+public extension NapStateStoring {
+    var loadFailureNotice: String? { nil }
 }
 
 private final class FileNapStore: NapStateStoring {
     private let url: URL
+    private(set) var loadFailureNotice: String?
 
     init(url: URL) {
         self.url = url
     }
 
     func load() -> SavedState? {
+        loadFailureNotice = nil
         guard let data = try? Data(contentsOf: url) else { return nil }
         if let state = try? JSONDecoder().decode(SavedState.self, from: data) {
             return state
@@ -111,6 +119,7 @@ private final class FileNapStore: NapStateStoring {
         if let legacy = try? JSONDecoder().decode(GammaSnapshot.self, from: data) {
             return SavedState(phase: .napping, displays: legacy.displays)
         }
+        loadFailureNotice = "恢复记录无法读取，已忽略。"
         return nil
     }
 
@@ -152,8 +161,17 @@ public struct NapController {
     public init(displays: DisplayGammaControlling, store: NapStateStoring) {
         self.displays = displays
         self.store = store
-        self.saved = store.load()
-        self.dimming = saved?.phase == .napping
+        let loaded = store.load()
+        if let loaded, !loaded.displays.isEmpty {
+            self.saved = loaded
+            self.dimming = loaded.phase == .napping
+            self.fileCleanupOnly = loaded.phase == .cleanupOnly
+        } else {
+            self.saved = nil
+            self.dimming = false
+            self.fileCleanupOnly = false
+            self.notice = loaded == nil ? store.loadFailureNotice : "恢复记录无效，已忽略。"
+        }
     }
 
     public init(displays: DisplayGammaControlling, savedURL: URL) {
@@ -187,7 +205,9 @@ public struct NapController {
         if unrestored.isEmpty {
             settleRestored(record: napping)
             if phase == .off {
-                notice = "切换失败，屏幕已恢复"
+                notice = results.values.contains(.ambiguous)
+                    ? "有多台显示器身份相同，未启用午休模式"
+                    : "切换失败，屏幕已恢复"
             }
             throw NapDisplayError.applyFailed
         }
@@ -198,7 +218,7 @@ public struct NapController {
         if replace(pending) {
             notice = "部分屏幕没能恢复，已停止压暗"
         } else {
-            notice = "部分屏幕没能恢复，已停止压暗。恢复记录更新失败，不会再次压暗。"
+            notice = "部分屏幕没能恢复，当前已停止压暗；状态文件更新失败，重启前请检查或删除状态文件。"
         }
         throw NapDisplayError.applyFailed
     }
@@ -227,7 +247,7 @@ public struct NapController {
         if replace(pending) {
             notice = Self.notice(for: results)
         } else {
-            notice = Self.notice(for: results) + "恢复记录更新失败，不会再次压暗。"
+            notice = Self.notice(for: results) + "当前已停止压暗，但状态文件更新失败，重启前请检查或删除状态文件。"
         }
     }
 
@@ -246,13 +266,13 @@ public struct NapController {
             return
         } catch {
         }
-        let pending = SavedState(phase: .pendingRestore, displays: record.displays)
-        saved = pending
+        let cleanup = SavedState(phase: .cleanupOnly, displays: record.displays)
+        saved = cleanup
         fileCleanupOnly = true
-        if replace(pending) {
+        if replace(cleanup) {
             notice = "屏幕已恢复，但恢复记录删除失败"
         } else {
-            notice = "屏幕已恢复，但恢复记录更新失败"
+            notice = "屏幕已恢复，但恢复记录更新失败，重启前请手动删除状态文件"
         }
     }
 

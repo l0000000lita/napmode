@@ -61,11 +61,29 @@ public func planDisplayWrites(targets: [DisplayTable], online: [OnlineDisplay]) 
     return plan
 }
 
+public func gammaChannelsAreWritable(_ table: DisplayTable, capacity: Int) -> Bool {
+    let count = table.red.count
+    let limit = capacity > 0 ? capacity : 256
+    guard count > 0,
+          count == table.green.count,
+          count == table.blue.count,
+          count <= limit else {
+        return false
+    }
+    let valid = { (samples: [Float]) in
+        samples.allSatisfy { $0.isFinite && (0...1).contains($0) }
+    }
+    return valid(table.red) && valid(table.green) && valid(table.blue)
+}
+
 public final class DisplayGamma: DisplayGammaControlling {
     public init() {}
 
     public func capture() throws -> GammaSnapshot {
-        let external = Self.onlineDisplays().filter { !$0.isBuiltin }
+        guard let allDisplays = Self.onlineDisplays() else {
+            throw NapDisplayError.applyFailed
+        }
+        let external = allDisplays.filter { !$0.isBuiltin }
         if external.isEmpty {
             throw NapDisplayError.noDisplay
         }
@@ -73,7 +91,13 @@ public final class DisplayGamma: DisplayGammaControlling {
     }
 
     public func apply(_ snapshot: GammaSnapshot) -> [DisplayIdentity: DisplayWriteResult] {
-        let plan = planDisplayWrites(targets: snapshot.displays, online: Self.onlineDisplays())
+        guard let allDisplays = Self.onlineDisplays() else {
+            return Dictionary(
+                snapshot.displays.map { ($0.identity, DisplayWriteResult.failed) },
+                uniquingKeysWith: { _, latest in latest }
+            )
+        }
+        let plan = planDisplayWrites(targets: snapshot.displays, online: allDisplays)
         var results: [DisplayIdentity: DisplayWriteResult] = [:]
         for item in plan {
             switch item {
@@ -97,8 +121,9 @@ public final class DisplayGamma: DisplayGammaControlling {
         return results
     }
 
-    private static func onlineDisplays() -> [OnlineDisplay] {
-        onlineIDs().map { id in
+    private static func onlineDisplays() -> [OnlineDisplay]? {
+        guard let ids = onlineIDs() else { return nil }
+        return ids.map { id in
             OnlineDisplay(
                 id: id,
                 identity: DisplayIdentity(
@@ -111,36 +136,48 @@ public final class DisplayGamma: DisplayGammaControlling {
         }
     }
 
-    private static func onlineIDs() -> [CGDirectDisplayID] {
-        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+    private static func onlineIDs() -> [CGDirectDisplayID]? {
+        var total: UInt32 = 0
+        guard CGGetOnlineDisplayList(0, nil, &total) == .success else { return nil }
+        guard total > 0 else { return [] }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(total))
         var count: UInt32 = 0
-        _ = ids.withUnsafeMutableBufferPointer { buffer in
-            CGGetOnlineDisplayList(UInt32(buffer.count), buffer.baseAddress, &count)
+        let err = ids.withUnsafeMutableBufferPointer { buffer in
+            CGGetOnlineDisplayList(total, buffer.baseAddress, &count)
         }
+        guard err == .success else { return nil }
         return Array(ids.prefix(Int(count)))
     }
 
     private static func read(_ id: CGDirectDisplayID) throws -> DisplayTable {
-        let capacity = 256
+        let hardware = Int(CGDisplayGammaTableCapacity(id))
+        let capacity = hardware > 0 ? hardware : 256
         var red = [CGGammaValue](repeating: 0, count: capacity)
         var green = [CGGammaValue](repeating: 0, count: capacity)
         var blue = [CGGammaValue](repeating: 0, count: capacity)
         var samples: UInt32 = 0
-        let err = red.withUnsafeMutableBufferPointer { redBuffer in
+        let err: CGError = red.withUnsafeMutableBufferPointer { redBuffer in
             green.withUnsafeMutableBufferPointer { greenBuffer in
                 blue.withUnsafeMutableBufferPointer { blueBuffer in
-                    CGGetDisplayTransferByTable(
+                    guard let redPointer = redBuffer.baseAddress,
+                          let greenPointer = greenBuffer.baseAddress,
+                          let bluePointer = blueBuffer.baseAddress else {
+                        return .illegalArgument
+                    }
+                    return CGGetDisplayTransferByTable(
                         id,
                         UInt32(capacity),
-                        redBuffer.baseAddress!,
-                        greenBuffer.baseAddress!,
-                        blueBuffer.baseAddress!,
+                        redPointer,
+                        greenPointer,
+                        bluePointer,
                         &samples
                     )
                 }
             }
         }
-        guard err == .success, samples > 0 else { throw NapDisplayError.applyFailed }
+        guard err == .success, samples > 0, Int(samples) <= capacity else {
+            throw NapDisplayError.applyFailed
+        }
         let count = Int(samples)
         return DisplayTable(
             vendor: CGDisplayVendorNumber(id),
@@ -153,20 +190,23 @@ public final class DisplayGamma: DisplayGammaControlling {
     }
 
     private static func write(_ table: DisplayTable, to id: CGDirectDisplayID) throws {
+        let capacity = Int(CGDisplayGammaTableCapacity(id))
+        guard gammaChannelsAreWritable(table, capacity: capacity),
+              let count = UInt32(exactly: table.red.count) else {
+            throw NapDisplayError.applyFailed
+        }
         var red = table.red
         var green = table.green
         var blue = table.blue
-        let count = UInt32(red.count)
-        let err = red.withUnsafeMutableBufferPointer { redBuffer in
+        let err: CGError = red.withUnsafeMutableBufferPointer { redBuffer in
             green.withUnsafeMutableBufferPointer { greenBuffer in
                 blue.withUnsafeMutableBufferPointer { blueBuffer in
-                    CGSetDisplayTransferByTable(
-                        id,
-                        count,
-                        redBuffer.baseAddress!,
-                        greenBuffer.baseAddress!,
-                        blueBuffer.baseAddress!
-                    )
+                    guard let redPointer = redBuffer.baseAddress,
+                          let greenPointer = greenBuffer.baseAddress,
+                          let bluePointer = blueBuffer.baseAddress else {
+                        return .illegalArgument
+                    }
+                    return CGSetDisplayTransferByTable(id, count, redPointer, greenPointer, bluePointer)
                 }
             }
         }

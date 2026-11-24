@@ -337,7 +337,7 @@ func testPartialRestoreKeepsRecordWhenFileReplaceFails() throws {
     try check(!nap.isOn, "partial failure must not keep dimming")
     try check(store.state?.phase == .napping, "failed replace leaves the napping file")
     try check(store.state?.displays.map(\.serial) == [1, 2], "failed replace must not drop a display")
-    try check(nap.notice?.contains("恢复记录更新失败") == true, "notice \(nap.notice ?? "")")
+    try check(nap.notice?.contains("状态文件更新失败") == true, "notice \(nap.notice ?? "")")
     let writesAfterStop = fake.writes.count
     nap.reapply()
     try check(fake.writes.count == writesAfterStop, "pending file failure must not dim")
@@ -386,6 +386,89 @@ func testRollbackCleanupFailureDoesNotLeaveNapOn() throws {
     try check(fake.writes.count == 2, "cleanup retry must not write again")
 }
 
+func testInvalidGammaTablesAreRejected() throws {
+    let ok = table(serial: 1, end: 1)
+    try check(gammaChannelsAreWritable(ok, capacity: 256), "a normal curve is writable")
+    var empty = ok
+    empty.red = []
+    empty.green = []
+    empty.blue = []
+    try check(!gammaChannelsAreWritable(empty, capacity: 256), "empty channels are rejected")
+    var short = ok
+    short.green = [0]
+    try check(!gammaChannelsAreWritable(short, capacity: 256), "unequal channels are rejected")
+    var nan = ok
+    nan.blue = [0, .nan]
+    try check(!gammaChannelsAreWritable(nan, capacity: 256), "NaN is rejected")
+    var infinite = ok
+    infinite.red = [0, .infinity]
+    try check(!gammaChannelsAreWritable(infinite, capacity: 256), "infinity is rejected")
+    var high = ok
+    high.red = [0, 1.2]
+    try check(!gammaChannelsAreWritable(high, capacity: 256), "values above 1 are rejected")
+    try check(!gammaChannelsAreWritable(ok, capacity: 1), "tables longer than capacity are rejected")
+}
+
+func testCleanupOnlyRelaunchDoesNotRewriteGamma() throws {
+    let fake = FakeDisplays(captured: GammaSnapshot(displays: [table(serial: 1, end: 1)]))
+    let store = ScriptedStore()
+    var nap = NapController(displays: fake, store: store)
+    try nap.start()
+    store.failRemove = true
+    nap.stop()
+    try check(store.state?.phase == .cleanupOnly, "delete failure is saved as cleanup only, got \(String(describing: store.state?.phase))")
+    let writes = fake.writes.count
+    store.failRemove = false
+
+    var again = NapController(displays: fake, store: store)
+    try check(!again.isOn, "cleanup record is not nap")
+    try check(again.phase == .pendingRestore, "cleanup record stays retryable")
+    again.stop()
+
+    try check(fake.writes.count == writes, "relaunch must not write gamma, got \(fake.writes.count) from \(writes)")
+    try check(again.phase == .off, "retry deletes the cleanup record")
+    try check(store.state == nil, "cleanup file removed")
+}
+
+func testAmbiguousStartKeepsTheSpecificNotice() throws {
+    let fake = FakeDisplays(captured: GammaSnapshot(displays: [table(serial: 1, end: 1), table(serial: 2, end: 1)]))
+    fake.handler = { _ in .ambiguous }
+    let store = ScriptedStore()
+    var nap = NapController(displays: fake, store: store)
+
+    do {
+        try nap.start()
+        throw CheckFailure(description: "ambiguous start should fail")
+    } catch NapDisplayError.applyFailed {
+    }
+
+    try check(nap.phase == .off, "ambiguous start does not stay on, got \(nap.phase)")
+    try check(fake.writes.isEmpty, "ambiguous start must not write")
+    try check(store.state == nil, "failed start removes the temporary record")
+    try check(nap.notice?.contains("身份相同") == true, "notice \(nap.notice ?? "")")
+}
+
+func testEmptyOrCorruptRecordDoesNotStartNap() throws {
+    let fake = FakeDisplays(captured: GammaSnapshot(displays: [table(serial: 1, end: 1)]))
+    let emptyStore = ScriptedStore()
+    emptyStore.state = SavedState(phase: .napping, displays: [])
+    let empty = NapController(displays: fake, store: emptyStore)
+    try check(empty.phase == .off, "empty record is off")
+    try check(!empty.isOn, "empty record must not dim")
+    try check(empty.notice?.contains("无效") == true, "notice \(empty.notice ?? "")")
+    empty.reapply()
+    try check(fake.writes.isEmpty, "empty record must not write")
+
+    let url = temporarySavedURL()
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data("{".utf8).write(to: url)
+    let corrupt = NapController(displays: fake, savedURL: url)
+    try check(corrupt.phase == .off, "corrupt record is off")
+    try check(corrupt.notice?.contains("无法读取") == true, "notice \(corrupt.notice ?? "")")
+    corrupt.reapply()
+    try check(fake.writes.isEmpty, "corrupt record must not write")
+}
+
 func testLiveRoundTrip() throws {
     let gamma = DisplayGamma()
     let before = try gamma.capture()
@@ -417,6 +500,10 @@ do {
     try testFullRestoreKeepsRetryWhenFileUpdateFails()
     try testPartialRestoreKeepsRecordWhenFileReplaceFails()
     try testRollbackCleanupFailureDoesNotLeaveNapOn()
+    try testInvalidGammaTablesAreRejected()
+    try testCleanupOnlyRelaunchDoesNotRewriteGamma()
+    try testAmbiguousStartKeepsTheSpecificNotice()
+    try testEmptyOrCorruptRecordDoesNotStartNap()
     if CommandLine.arguments.contains("--live") {
         try testLiveRoundTrip()
     }
