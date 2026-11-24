@@ -267,6 +267,125 @@ func testAmbiguousIdentityIsNotWrittenTwice() throws {
     try check(writes == [4], "one display id is used once, got \(reused)")
 }
 
+final class ScriptedStore: NapStateStoring {
+    struct Failure: Error {}
+
+    var state: SavedState?
+    var replaceCount = 0
+    var failReplaceAfter = Int.max
+    var failRemove = false
+
+    func load() -> SavedState? { state }
+
+    func replace(_ state: SavedState) throws {
+        replaceCount += 1
+        if replaceCount > failReplaceAfter { throw Failure() }
+        self.state = state
+    }
+
+    func remove() throws {
+        if failRemove { throw Failure() }
+        state = nil
+    }
+}
+
+func testFullRestoreKeepsRetryWhenFileUpdateFails() throws {
+    let fake = FakeDisplays(captured: GammaSnapshot(displays: [table(serial: 1, end: 1)]))
+    let store = ScriptedStore()
+    var nap = NapController(displays: fake, store: store)
+    try nap.start()
+    let writesAfterStart = fake.writes.count
+    store.failRemove = true
+    store.failReplaceAfter = store.replaceCount
+
+    nap.stop()
+    let writesAfterRestore = fake.writes.count
+
+    try check(writesAfterRestore > writesAfterStart, "stop still restores the display")
+    try check(fake.writes.last?.red.last == 1, "restore writes the original, got \(fake.writes)")
+    try check(nap.phase == .pendingRestore, "file failure must stay retryable, got \(nap.phase)")
+    try check(!nap.isOn, "ended nap must not stay on")
+    try check(store.state?.phase == .napping, "disk can still say napping, got \(String(describing: store.state?.phase))")
+    try check(store.state?.displays[0].red.last == 1, "disk keeps the original curve")
+    try check(nap.notice?.contains("屏幕已恢复") == true, "notice \(nap.notice ?? "")")
+    try check(nap.notice?.contains("恢复记录更新失败") == true, "notice \(nap.notice ?? "")")
+    nap.reapply()
+    try check(fake.writes.count == writesAfterRestore, "timer must not dim after the user ended nap")
+    try nap.start()
+    try check(store.state?.displays[0].red.last == 1, "start must not overwrite the original")
+    try check(fake.writes.count == writesAfterRestore, "blocked start must not write")
+
+    store.failRemove = false
+    store.failReplaceAfter = Int.max
+    nap.stop()
+    try check(nap.phase == .off, "retry can clear the record, got \(nap.phase)")
+    try check(store.state == nil, "retry deletes the file")
+    try check(fake.writes.count == writesAfterRestore, "file retry must not rewrite the display")
+}
+
+func testPartialRestoreKeepsRecordWhenFileReplaceFails() throws {
+    let fake = FakeDisplays(captured: GammaSnapshot(displays: [table(serial: 1, end: 1), table(serial: 2, end: 1)]))
+    let store = ScriptedStore()
+    var nap = NapController(displays: fake, store: store)
+    try nap.start()
+    fake.handler = { display in display.serial == 1 ? .applied : .failed }
+    store.failReplaceAfter = store.replaceCount
+
+    nap.stop()
+
+    try check(nap.phase == .pendingRestore, "partial failure stays pending, got \(nap.phase)")
+    try check(!nap.isOn, "partial failure must not keep dimming")
+    try check(store.state?.phase == .napping, "failed replace leaves the napping file")
+    try check(store.state?.displays.map(\.serial) == [1, 2], "failed replace must not drop a display")
+    try check(nap.notice?.contains("恢复记录更新失败") == true, "notice \(nap.notice ?? "")")
+    let writesAfterStop = fake.writes.count
+    nap.reapply()
+    try check(fake.writes.count == writesAfterStop, "pending file failure must not dim")
+    try nap.start()
+    try check(store.state?.displays.map(\.serial) == [1, 2], "start must not overwrite the backup")
+
+    store.failReplaceAfter = Int.max
+    nap.stop()
+    try check(store.state?.phase == .pendingRestore, "retry persists the unrestored display")
+    try check(store.state?.displays.map(\.serial) == [2], "retry keeps only the failed display, got \(String(describing: store.state?.displays))")
+    try check(store.state?.displays[0].red.last == 1, "kept curve is original")
+    try check(!nap.isOn, "retry stays out of nap")
+}
+
+func testRollbackCleanupFailureDoesNotLeaveNapOn() throws {
+    let fake = FakeDisplays(captured: GammaSnapshot(displays: [table(serial: 1, end: 1), table(serial: 2, end: 1)]))
+    fake.handler = { display in display.serial == 2 ? .failed : .applied }
+    let store = ScriptedStore()
+    store.failRemove = true
+    store.failReplaceAfter = 1
+    var nap = NapController(displays: fake, store: store)
+
+    do {
+        try nap.start()
+        throw CheckFailure(description: "start should fail")
+    } catch NapDisplayError.applyFailed {
+    }
+
+    try check(nap.phase == .pendingRestore, "rolled-back start with a stuck file stays retryable, got \(nap.phase)")
+    try check(!nap.isOn, "rolled-back start must not stay on")
+    try check(fake.writes.count == 2, "dim then rollback, got \(fake.writes)")
+    try check(fake.writes[1].red.last == 1, "rollback restored the first display")
+    try check(store.state?.phase == .napping, "cleanup failure leaves the old napping file")
+    try check(store.state?.displays.map(\.serial) == [1, 2], "original backup stays complete")
+    try check(nap.notice?.contains("屏幕已恢复") == true, "notice \(nap.notice ?? "")")
+    try check(nap.notice?.contains("恢复记录更新失败") == true, "notice \(nap.notice ?? "")")
+    nap.reapply()
+    try nap.start()
+    try check(fake.writes.count == 2, "must not dim or overwrite after cleanup failure")
+
+    store.failRemove = false
+    store.failReplaceAfter = Int.max
+    nap.stop()
+    try check(nap.phase == .off, "later stop can delete the stuck file")
+    try check(store.state == nil, "stuck file removed")
+    try check(fake.writes.count == 2, "cleanup retry must not write again")
+}
+
 func testLiveRoundTrip() throws {
     let gamma = DisplayGamma()
     let before = try gamma.capture()
@@ -295,6 +414,9 @@ do {
     try testRelaunchNapKeepsDimmingAndPendingDoesNot()
     try testRepeatedStopDoesNotRewriteOriginals()
     try testAmbiguousIdentityIsNotWrittenTwice()
+    try testFullRestoreKeepsRetryWhenFileUpdateFails()
+    try testPartialRestoreKeepsRecordWhenFileReplaceFails()
+    try testRollbackCleanupFailureDoesNotLeaveNapOn()
     if CommandLine.arguments.contains("--live") {
         try testLiveRoundTrip()
     }

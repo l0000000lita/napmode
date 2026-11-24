@@ -90,6 +90,44 @@ public protocol DisplayGammaControlling: AnyObject {
     func apply(_ snapshot: GammaSnapshot) -> [DisplayIdentity: DisplayWriteResult]
 }
 
+public protocol NapStateStoring: AnyObject {
+    func load() -> SavedState?
+    func replace(_ state: SavedState) throws
+    func remove() throws
+}
+
+private final class FileNapStore: NapStateStoring {
+    private let url: URL
+
+    init(url: URL) {
+        self.url = url
+    }
+
+    func load() -> SavedState? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        if let state = try? JSONDecoder().decode(SavedState.self, from: data) {
+            return state
+        }
+        if let legacy = try? JSONDecoder().decode(GammaSnapshot.self, from: data) {
+            return SavedState(phase: .napping, displays: legacy.displays)
+        }
+        return nil
+    }
+
+    func replace(_ state: SavedState) throws {
+        let directory = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let data = try JSONEncoder().encode(state)
+        try data.write(to: url, options: .atomic)
+    }
+
+    func remove() throws {
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+}
+
 public enum NapDisplayError: Error {
     case noDisplay
     case applyFailed
@@ -97,27 +135,29 @@ public enum NapDisplayError: Error {
 
 public struct NapController {
     private let displays: DisplayGammaControlling
-    private let savedURL: URL
+    private let store: NapStateStoring
     private var saved: SavedState?
+    private var dimming = false
+    private var fileCleanupOnly = false
     public private(set) var notice: String?
 
     public var phase: NapPhase {
-        switch saved?.phase {
-        case .napping:
-            return .napping
-        case .pendingRestore:
-            return .pendingRestore
-        case nil:
-            return .off
-        }
+        if dimming { return .napping }
+        if saved != nil { return .pendingRestore }
+        return .off
     }
 
     public var isOn: Bool { phase == .napping }
 
-    public init(displays: DisplayGammaControlling, savedURL: URL) {
+    public init(displays: DisplayGammaControlling, store: NapStateStoring) {
         self.displays = displays
-        self.savedURL = savedURL
-        self.saved = Self.load(savedURL)
+        self.store = store
+        self.saved = store.load()
+        self.dimming = saved?.phase == .napping
+    }
+
+    public init(displays: DisplayGammaControlling, savedURL: URL) {
+        self.init(displays: displays, store: FileNapStore(url: savedURL))
     }
 
     public mutating func start() throws {
@@ -127,8 +167,10 @@ public struct NapController {
             throw NapDisplayError.noDisplay
         }
         let napping = SavedState(phase: .napping, displays: current.displays)
-        try persist(napping)
+        try store.replace(napping)
         saved = napping
+        dimming = true
+        fileCleanupOnly = false
 
         let results = displays.apply(current.scaledForNap())
         if current.displays.allSatisfy({ results[$0.identity] == .applied }) {
@@ -141,66 +183,86 @@ public struct NapController {
             ? [:]
             : displays.apply(GammaSnapshot(displays: applied))
         let unrestored = applied.filter { rollback[$0.identity] != .applied }
+        dimming = false
         if unrestored.isEmpty {
-            saved = nil
-            try? FileManager.default.removeItem(at: savedURL)
-            notice = "切换失败，屏幕已恢复"
+            settleRestored(record: napping)
+            if phase == .off {
+                notice = "切换失败，屏幕已恢复"
+            }
             throw NapDisplayError.applyFailed
         }
 
         let pending = SavedState(phase: .pendingRestore, displays: unrestored)
-        try persist(pending)
         saved = pending
-        notice = "部分屏幕没能恢复，已停止压暗"
+        fileCleanupOnly = false
+        if replace(pending) {
+            notice = "部分屏幕没能恢复，已停止压暗"
+        } else {
+            notice = "部分屏幕没能恢复，已停止压暗。恢复记录更新失败，不会再次压暗。"
+        }
         throw NapDisplayError.applyFailed
     }
 
     public mutating func stop() {
         guard var record = saved else { return }
-        if record.phase == .napping {
+        if fileCleanupOnly {
+            settleRestored(record: record)
+            return
+        }
+        if dimming {
+            dimming = false
             record.phase = .pendingRestore
-            if (try? persist(record)) != nil {
-                saved = record
-            }
+            saved = record
+            _ = replace(record)
         }
         let results = displays.apply(GammaSnapshot(displays: record.displays))
         let remaining = record.displays.filter { results[$0.identity] != .applied }
         if remaining.isEmpty {
-            saved = nil
-            try? FileManager.default.removeItem(at: savedURL)
-            notice = nil
+            settleRestored(record: record)
             return
         }
         let pending = SavedState(phase: .pendingRestore, displays: remaining)
-        if (try? persist(pending)) != nil {
-            saved = pending
+        saved = pending
+        fileCleanupOnly = false
+        if replace(pending) {
+            notice = Self.notice(for: results)
         } else {
-            saved = pending
+            notice = Self.notice(for: results) + "恢复记录更新失败，不会再次压暗。"
         }
-        notice = Self.notice(for: results)
     }
 
     public func reapply() {
-        guard let saved, saved.phase == .napping else { return }
+        guard dimming, let saved else { return }
         _ = displays.apply(GammaSnapshot(displays: saved.displays).scaledForNap())
     }
 
-    private func persist(_ state: SavedState) throws {
-        let directory = savedURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let data = try JSONEncoder().encode(state)
-        try data.write(to: savedURL, options: .atomic)
+    private mutating func settleRestored(record: SavedState) {
+        dimming = false
+        do {
+            try store.remove()
+            saved = nil
+            fileCleanupOnly = false
+            notice = nil
+            return
+        } catch {
+        }
+        let pending = SavedState(phase: .pendingRestore, displays: record.displays)
+        saved = pending
+        fileCleanupOnly = true
+        if replace(pending) {
+            notice = "屏幕已恢复，但恢复记录删除失败"
+        } else {
+            notice = "屏幕已恢复，但恢复记录更新失败"
+        }
     }
 
-    private static func load(_ url: URL) -> SavedState? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        if let state = try? JSONDecoder().decode(SavedState.self, from: data) {
-            return state
+    private func replace(_ state: SavedState) -> Bool {
+        do {
+            try store.replace(state)
+            return true
+        } catch {
+            return false
         }
-        if let legacy = try? JSONDecoder().decode(GammaSnapshot.self, from: data) {
-            return SavedState(phase: .napping, displays: legacy.displays)
-        }
-        return nil
     }
 
     private static func notice(for results: [DisplayIdentity: DisplayWriteResult]) -> String {
